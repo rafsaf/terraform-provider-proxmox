@@ -30,9 +30,8 @@ import (
 
 	"github.com/bpg/terraform-provider-proxmox/fwprovider/attribute"
 	"github.com/bpg/terraform-provider-proxmox/fwprovider/config"
-	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
-
 	"github.com/bpg/terraform-provider-proxmox/proxmox"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/storage"
 	proxmoxtypes "github.com/bpg/terraform-provider-proxmox/proxmox/types"
@@ -41,6 +40,8 @@ import (
 var (
 	_         resource.Resource              = &downloadFileResource{}
 	_         resource.ResourceWithConfigure = &downloadFileResource{}
+	_         planmodifier.Int64             = &sizeRequiresReplaceModifier{}
+	_         planmodifier.Int64             = &remoteSizeRequiresReplaceModifier{}
 	httpRegex                                = regexp.MustCompile(`https?://.*`)
 )
 
@@ -66,9 +67,27 @@ func (r sizeRequiresReplaceModifier) PlanModifyInt64(
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 
-	originalStateSizeBytes, diags := req.Private.GetKey(ctx, "original_state_size")
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
+	// Already return early here if Overwrite is false
+	if !plan.Overwrite.ValueBool() {
+		return
+	}
+
+	originalStateSizeBytes, diags := req.Private.GetKey(ctx, "original_state_size")
 	resp.Diagnostics.Append(diags...)
+
+	originalUrlSizeBytes, diags := req.Private.GetKey(ctx, "original_url_size")
+	resp.Diagnostics.Append(diags...)
+
+	urlSizeBytes, diags := req.Private.GetKey(ctx, "url_size")
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	if originalStateSizeBytes != nil {
 		originalStateSize, err := strconv.ParseInt(string(originalStateSizeBytes), 10, 64)
@@ -84,7 +103,7 @@ func (r sizeRequiresReplaceModifier) PlanModifyInt64(
 			return
 		}
 
-		if state.Size.ValueInt64() != originalStateSize && plan.Overwrite.ValueBool() {
+		if state.Size.ValueInt64() != originalStateSize {
 			resp.RequiresReplace = true
 			resp.PlanValue = types.Int64Value(originalStateSize)
 
@@ -100,10 +119,6 @@ func (r sizeRequiresReplaceModifier) PlanModifyInt64(
 			return
 		}
 	}
-
-	urlSizeBytes, diags := req.Private.GetKey(ctx, "url_size")
-
-	resp.Diagnostics.Append(diags...)
 
 	if (urlSizeBytes != nil) && (plan.URL.ValueString() == state.URL.ValueString()) {
 		urlSize, err := strconv.ParseInt(string(urlSizeBytes), 10, 64)
@@ -154,6 +169,121 @@ func (r sizeRequiresReplaceModifier) Description(_ context.Context) string {
 }
 
 func (r sizeRequiresReplaceModifier) MarkdownDescription(_ context.Context) string {
+	return "Triggers resource force replacement if `size` in state does not match remote value."
+}
+
+type remoteSizeRequiresReplaceModifier struct{}
+
+func (r remoteSizeRequiresReplaceModifier) PlanModifyInt64(
+	ctx context.Context,
+	req planmodifier.Int64Request,
+	resp *planmodifier.Int64Response,
+) {
+	// Do not replace on resource creation.
+	if req.State.Raw.IsNull() {
+		return
+	}
+
+	// Do not replace on resource destroy.
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var plan, state downloadFileModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Already return early here if Overwrite is false
+	if !plan.Overwrite.ValueBool() {
+		return
+	}
+
+	originalStateSizeBytes, diags := req.Private.GetKey(ctx, "original_state_size")
+	resp.Diagnostics.Append(diags...)
+
+	originalUrlSizeBytes, diags := req.Private.GetKey(ctx, "original_url_size")
+	resp.Diagnostics.Append(diags...)
+
+	urlSizeBytes, diags := req.Private.GetKey(ctx, "url_size")
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if originalStateSizeBytes != nil {
+		originalStateSize, err := strconv.ParseInt(string(originalStateSizeBytes), 10, 64)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Unexpected error when reading originalStateSize from Private",
+				fmt.Sprintf(
+					"Unexpected error in ParseInt: %s",
+					err.Error(),
+				),
+			)
+
+			return
+		}
+
+		if state.Size.ValueInt64() != originalStateSize {
+			resp.RequiresReplace = true
+			resp.PlanValue = types.Int64Value(originalStateSize)
+
+			resp.Diagnostics.AddWarning(
+				"The file size in datastore has changed.",
+				fmt.Sprintf(
+					"Previous size %d does not match size from datastore: %d",
+					originalStateSize,
+					state.Size.ValueInt64(),
+				),
+			)
+
+			return
+		}
+	}
+
+	if (urlSizeBytes != nil) && (plan.URL.ValueString() == state.URL.ValueString()) {
+		urlSize, err := strconv.ParseInt(string(urlSizeBytes), 10, 64)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Unexpected error when reading urlSize from Private",
+				fmt.Sprintf(
+					"Unexpected error in ParseInt: %s",
+					err.Error(),
+				),
+			)
+
+			return
+		}
+
+		if state.Size.ValueInt64() != urlSize {
+			resp.RequiresReplace = true
+			resp.PlanValue = types.Int64Value(urlSize)
+
+			resp.Diagnostics.AddWarning(
+				"The file size from url has changed.",
+				fmt.Sprintf(
+					"Size from url %d does not match size from datastore: %d",
+					urlSize,
+					state.Size.ValueInt64(),
+				),
+			)
+
+			return
+		}
+	}
+}
+
+func (r remoteSizeRequiresReplaceModifier) Description(_ context.Context) string {
+	return "Triggers resource force replacement if `size` in state does not match remote value."
+}
+
+func (r remoteSizeRequiresReplaceModifier) MarkdownDescription(_ context.Context) string {
 	return "Triggers resource force replacement if `size` in state does not match remote value."
 }
 
@@ -242,14 +372,25 @@ func (r *downloadFileResource) Schema(
 				},
 			},
 			"size": schema.Int64Attribute{
-				Description: "The file size.",
+				Description: "The file size in PVE datastore (known after it is uploaded). " +
+					"It may not be the same as `remote_size`, for example " +
+					"when `decompression_algorithm` is used, it will be bigger.",
+				Optional: false,
+				Required: false,
+				Computed: true,
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.UseStateForUnknown(),
+					sizeRequiresReplaceModifier{},
+				},
+			},
+			"remote_size": schema.Int64Attribute{
+				Description: "The file size calculated using content-length header.",
 				Optional:    false,
 				Required:    false,
 				Computed:    true,
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
-					int64planmodifier.RequiresReplace(),
-					sizeRequiresReplaceModifier{},
+					remoteSizeRequiresReplaceModifier{},
 				},
 			},
 			"upload_timeout": schema.Int64Attribute{
@@ -283,7 +424,10 @@ func (r *downloadFileResource) Schema(
 				Description: "Decompress the downloaded file using the " +
 					"specified compression algorithm. Must be one of `gz` | `lzo` | `zst` | `bz2`.",
 				Optional: true,
-				Default:  nil,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+				Default: nil,
 				Validators: []validator.String{
 					stringvalidator.OneOf([]string{
 						"gz",
@@ -534,9 +678,6 @@ func (r *downloadFileResource) Read(
 		return
 	}
 
-	setOriginalValue := []byte(strconv.FormatInt(state.Size.ValueInt64(), 10))
-	resp.Private.SetKey(ctx, "original_state_size", setOriginalValue)
-
 	err := r.read(ctx, &state)
 	if err != nil {
 		if strings.Contains(err.Error(), "failed to authenticate") {
@@ -555,6 +696,10 @@ func (r *downloadFileResource) Read(
 	}
 
 	if state.Overwrite.ValueBool() {
+		// after read method used, state is updated with PVE size
+		pveSize := []byte(strconv.FormatInt(state.Size.ValueInt64(), 10))
+		resp.Private.SetKey(ctx, "pve_size", pveSize)
+
 		// with overwrite, use url to get proper target size
 		urlMetadata, err := r.getURLMetadata(
 			ctx,
