@@ -40,14 +40,14 @@ import (
 var (
 	_         resource.Resource              = &downloadFileResource{}
 	_         resource.ResourceWithConfigure = &downloadFileResource{}
-	_         planmodifier.Int64             = &sizeRequiresReplaceModifier{}
-	_         planmodifier.Int64             = &remoteSizeRequiresReplaceModifier{}
+	_         planmodifier.Int64             = &pveSizeRequiresReplaceModifier{}
+	_         planmodifier.Int64             = &urlSizeRequiresReplaceModifier{}
 	httpRegex                                = regexp.MustCompile(`https?://.*`)
 )
 
-type sizeRequiresReplaceModifier struct{}
+type pveSizeRequiresReplaceModifier struct{}
 
-func (r sizeRequiresReplaceModifier) PlanModifyInt64(
+func (r pveSizeRequiresReplaceModifier) PlanModifyInt64(
 	ctx context.Context,
 	req planmodifier.Int64Request,
 	resp *planmodifier.Int64Response,
@@ -76,105 +76,73 @@ func (r sizeRequiresReplaceModifier) PlanModifyInt64(
 		return
 	}
 
-	originalStateSizeBytes, diags := req.Private.GetKey(ctx, "original_state_size")
-	resp.Diagnostics.Append(diags...)
-
-	originalUrlSizeBytes, diags := req.Private.GetKey(ctx, "original_url_size")
-	resp.Diagnostics.Append(diags...)
-
-	urlSizeBytes, diags := req.Private.GetKey(ctx, "url_size")
+	stateSizeBytes, diags := req.Private.GetKey(ctx, "state_pve_size")
 	resp.Diagnostics.Append(diags...)
 
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if originalStateSizeBytes != nil {
-		originalStateSize, err := strconv.ParseInt(string(originalStateSizeBytes), 10, 64)
-		if err != nil {
-			resp.Diagnostics.AddError(
-				"Unexpected error when reading originalStateSize from Private",
-				fmt.Sprintf(
-					"Unexpected error in ParseInt: %s",
-					err.Error(),
-				),
-			)
+	tflog.Error(ctx, fmt.Sprintf("plan %s", plan))
+	tflog.Error(ctx, fmt.Sprintf("state %s", state))
 
-			return
-		}
+	if stateSizeBytes == nil {
+		resp.Diagnostics.AddError(
+			"Unable to get original state file size",
+			"Unexpected error in req.Private.GetKey, key state_pve_size does not exists. "+
+				"Please retry the operation or report this issue to the provider developers.\n\n",
+		)
 
-		if state.Size.ValueInt64() != originalStateSize {
-			resp.RequiresReplace = true
-			resp.PlanValue = types.Int64Value(originalStateSize)
-
-			resp.Diagnostics.AddWarning(
-				"The file size in datastore has changed.",
-				fmt.Sprintf(
-					"Previous size %d does not match size from datastore: %d",
-					originalStateSize,
-					state.Size.ValueInt64(),
-				),
-			)
-
-			return
-		}
+		return
 	}
 
-	if (urlSizeBytes != nil) && (plan.URL.ValueString() == state.URL.ValueString()) {
-		urlSize, err := strconv.ParseInt(string(urlSizeBytes), 10, 64)
-		if err != nil {
-			resp.Diagnostics.AddError(
-				"Unexpected error when reading urlSize from Private",
-				fmt.Sprintf(
-					"Unexpected error in ParseInt: %s",
-					err.Error(),
-				),
-			)
+	// after read() method is used, in state we get current size from PVE instead of old one
+	pveSize := state.Size.ValueInt64()
 
-			return
-		}
+	tflog.Error(ctx, fmt.Sprintf("pve %d", pveSize))
+	tflog.Error(ctx, fmt.Sprintf("old state %s", stateSizeBytes))
 
-		if state.Size.ValueInt64() != urlSize {
-			if urlSize < 0 {
-				resp.Diagnostics.AddWarning(
-					"Could not read the file metadata from URL.",
-					fmt.Sprintf(
-						"The remote file at URL %q most likely doesn’t exist or can’t be accessed.\n"+
-							"To skip the remote file check, set `overwrite` to `false`.",
-						plan.URL.ValueString(),
-					),
-				)
-			} else {
-				resp.RequiresReplace = true
-				resp.PlanValue = types.Int64Value(urlSize)
+	stateSize, err := strconv.ParseInt(string(stateSizeBytes), 10, 64)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to convert original state file size to int64",
+			"Unexpected error in parsing string to int64, key state_pve_size. "+
+				"Please retry the operation or report this issue to the provider developers.\n\n"+
+				"Error: "+err.Error(),
+		)
 
-				resp.Diagnostics.AddWarning(
-					"The file size from url has changed.",
-					fmt.Sprintf(
-						"Size %d from url %q does not match size from datastore: %d",
-						urlSize,
-						plan.URL.ValueString(),
-						state.Size.ValueInt64(),
-					),
-				)
-			}
+		return
+	}
 
-			return
-		}
+	if stateSize != pveSize {
+		resp.RequiresReplace = true
+		resp.PlanValue = types.Int64Value(stateSize)
+
+		resp.Diagnostics.AddWarning(
+			"The file size in datastore has changed outside of terraform.",
+			fmt.Sprintf(
+				"Previous size: %d saved in state does not match current size from datastore: %d. "+
+					"You can disable this behaviour by using overwrite=false",
+				stateSize,
+				pveSize,
+			),
+		)
+
+		return
 	}
 }
 
-func (r sizeRequiresReplaceModifier) Description(_ context.Context) string {
+func (r pveSizeRequiresReplaceModifier) Description(_ context.Context) string {
 	return "Triggers resource force replacement if `size` in state does not match remote value."
 }
 
-func (r sizeRequiresReplaceModifier) MarkdownDescription(_ context.Context) string {
+func (r pveSizeRequiresReplaceModifier) MarkdownDescription(_ context.Context) string {
 	return "Triggers resource force replacement if `size` in state does not match remote value."
 }
 
-type remoteSizeRequiresReplaceModifier struct{}
+type urlSizeRequiresReplaceModifier struct{}
 
-func (r remoteSizeRequiresReplaceModifier) PlanModifyInt64(
+func (r urlSizeRequiresReplaceModifier) PlanModifyInt64(
 	ctx context.Context,
 	req planmodifier.Int64Request,
 	resp *planmodifier.Int64Response,
@@ -203,88 +171,66 @@ func (r remoteSizeRequiresReplaceModifier) PlanModifyInt64(
 		return
 	}
 
-	originalStateSizeBytes, diags := req.Private.GetKey(ctx, "original_state_size")
-	resp.Diagnostics.Append(diags...)
+	// Handle IsUnknown - backward compability
+	// Handle IsNull - that means url initially didn't have content-length header
+	// and checking remote size makes no sense
+	if plan.RemoteSize.IsUnknown() || plan.RemoteSize.IsNull() {
+		return
+	}
 
-	originalUrlSizeBytes, diags := req.Private.GetKey(ctx, "original_url_size")
-	resp.Diagnostics.Append(diags...)
-
-	urlSizeBytes, diags := req.Private.GetKey(ctx, "url_size")
+	urlSizeBytes, diags := req.Private.GetKey(ctx, "current_url_size")
 	resp.Diagnostics.Append(diags...)
 
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if originalStateSizeBytes != nil {
-		originalStateSize, err := strconv.ParseInt(string(originalStateSizeBytes), 10, 64)
-		if err != nil {
-			resp.Diagnostics.AddError(
-				"Unexpected error when reading originalStateSize from Private",
-				fmt.Sprintf(
-					"Unexpected error in ParseInt: %s",
-					err.Error(),
-				),
-			)
+	if urlSizeBytes == nil {
+		resp.Diagnostics.AddError(
+			"Unable to get PVE remote file size (from url)",
+			"Unexpected error in req.Private.GetKey, key current_url_size does not exists. "+
+				"Please retry the operation or report this issue to the provider developers.\n\n",
+		)
 
-			return
-		}
-
-		if state.Size.ValueInt64() != originalStateSize {
-			resp.RequiresReplace = true
-			resp.PlanValue = types.Int64Value(originalStateSize)
-
-			resp.Diagnostics.AddWarning(
-				"The file size in datastore has changed.",
-				fmt.Sprintf(
-					"Previous size %d does not match size from datastore: %d",
-					originalStateSize,
-					state.Size.ValueInt64(),
-				),
-			)
-
-			return
-		}
+		return
 	}
 
-	if (urlSizeBytes != nil) && (plan.URL.ValueString() == state.URL.ValueString()) {
-		urlSize, err := strconv.ParseInt(string(urlSizeBytes), 10, 64)
-		if err != nil {
-			resp.Diagnostics.AddError(
-				"Unexpected error when reading urlSize from Private",
-				fmt.Sprintf(
-					"Unexpected error in ParseInt: %s",
-					err.Error(),
-				),
-			)
+	urlSize, err := strconv.ParseInt(string(urlSizeBytes), 10, 64)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Unable to convert PVE remote file size (from url) to int64",
+			"Unexpected error in parsing string to int64, key current_url_size. "+
+				"Please retry the operation or report this issue to the provider developers.\n\n"+
+				"Error: "+err.Error(),
+		)
 
-			return
-		}
+		return
+	}
 
-		if state.Size.ValueInt64() != urlSize {
-			resp.RequiresReplace = true
-			resp.PlanValue = types.Int64Value(urlSize)
+	if state.RemoteSize.ValueInt64() != urlSize {
+		resp.RequiresReplace = true
+		resp.PlanValue = types.Int64Value(urlSize)
 
-			resp.Diagnostics.AddWarning(
-				"The file size from url has changed.",
-				fmt.Sprintf(
-					"Size from url %d does not match size from datastore: %d",
-					urlSize,
-					state.Size.ValueInt64(),
-				),
-			)
+		resp.Diagnostics.AddWarning(
+			"The remote file size from url has changed outside of terraform.",
+			fmt.Sprintf(
+				"Previous size: %d saved in state does not match current file size from url: %d. "+
+					"You can disable this behaviour by using overwrite=false",
+				state.RemoteSize.ValueInt64(),
+				urlSize,
+			),
+		)
 
-			return
-		}
+		return
 	}
 }
 
-func (r remoteSizeRequiresReplaceModifier) Description(_ context.Context) string {
-	return "Triggers resource force replacement if `size` in state does not match remote value."
+func (r urlSizeRequiresReplaceModifier) Description(_ context.Context) string {
+	return "Triggers resource force replacement if `remote_size` in state does not match remote value."
 }
 
-func (r remoteSizeRequiresReplaceModifier) MarkdownDescription(_ context.Context) string {
-	return "Triggers resource force replacement if `size` in state does not match remote value."
+func (r urlSizeRequiresReplaceModifier) MarkdownDescription(_ context.Context) string {
+	return "Triggers resource force replacement if `remote_size` in state does not match remote value."
 }
 
 type downloadFileModel struct {
@@ -294,6 +240,7 @@ type downloadFileModel struct {
 	Storage                types.String `tfsdk:"datastore_id"`
 	Node                   types.String `tfsdk:"node_name"`
 	Size                   types.Int64  `tfsdk:"size"`
+	RemoteSize             types.Int64  `tfsdk:"remote_size"`
 	URL                    types.String `tfsdk:"url"`
 	Checksum               types.String `tfsdk:"checksum"`
 	DecompressionAlgorithm types.String `tfsdk:"decompression_algorithm"`
@@ -380,17 +327,17 @@ func (r *downloadFileResource) Schema(
 				Computed: true,
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
-					sizeRequiresReplaceModifier{},
+					pveSizeRequiresReplaceModifier{},
 				},
 			},
 			"remote_size": schema.Int64Attribute{
-				Description: "The file size calculated using content-length header.",
+				Description: "The file size calculated using Content-Length header.",
 				Optional:    false,
 				Required:    false,
 				Computed:    true,
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
-					remoteSizeRequiresReplaceModifier{},
+					urlSizeRequiresReplaceModifier{},
 				},
 			},
 			"upload_timeout": schema.Int64Attribute{
@@ -464,12 +411,14 @@ func (r *downloadFileResource) Schema(
 				Default:     booldefault.StaticBool(true),
 			},
 			"overwrite": schema.BoolAttribute{
-				Description: "If `true` and size of uploaded file is different, " +
-					"than size from `url` Content-Length header, file will be downloaded again. " +
-					"If `false`, there will be no checks.",
+				Description: "By default `false`. If `true` is used, 2 checks will be performed. " +
+					"First, size saved in state will be compared to current size from PVE, then " +
+					"remote_size from state will be compared to current Content-Length value " +
+					"from url. If any of those has changed, resource will be recreated. " +
+					"If `false`, there will be no such checks.",
 				Optional: true,
 				Computed: true,
-				Default:  booldefault.StaticBool(true),
+				Default:  booldefault.StaticBool(false),
 			},
 			"overwrite_unmanaged": schema.BoolAttribute{
 				Description: "If `true` and a file with the same name already exists in the datastore, " +
@@ -536,6 +485,8 @@ func (r *downloadFileResource) Create(
 
 		return
 	}
+
+	plan.RemoteSize = types.Int64PointerValue(fileMetadata.Size)
 
 	if plan.FileName.IsUnknown() {
 		plan.FileName = types.StringValue(*fileMetadata.Filename)
@@ -678,6 +629,9 @@ func (r *downloadFileResource) Read(
 		return
 	}
 
+	stateSize := []byte(strconv.FormatInt(state.Size.ValueInt64(), 10))
+	resp.Private.SetKey(ctx, "state_pve_size", stateSize)
+
 	err := r.read(ctx, &state)
 	if err != nil {
 		if strings.Contains(err.Error(), "failed to authenticate") {
@@ -693,29 +647,6 @@ func (r *downloadFileResource) Read(
 		resp.State.RemoveResource(ctx)
 
 		return
-	}
-
-	if state.Overwrite.ValueBool() {
-		// after read method used, state is updated with PVE size
-		pveSize := []byte(strconv.FormatInt(state.Size.ValueInt64(), 10))
-		resp.Private.SetKey(ctx, "pve_size", pveSize)
-
-		// with overwrite, use url to get proper target size
-		urlMetadata, err := r.getURLMetadata(
-			ctx,
-			&state,
-		)
-		if err != nil {
-			tflog.Error(ctx, "Could not get file metadata from url", map[string]interface{}{
-				"error": err,
-				"url":   state.URL.ValueString(),
-			})
-			// force size to -1, which is a special value used in sizeRequiresReplaceModifier
-			resp.Private.SetKey(ctx, "url_size", []byte("-1"))
-		} else if urlMetadata.Size != nil {
-			setValue := []byte(strconv.FormatInt(*urlMetadata.Size, 10))
-			resp.Private.SetKey(ctx, "url_size", setValue)
-		}
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
@@ -740,6 +671,22 @@ func (r *downloadFileResource) Update(
 
 		return
 	}
+
+	urlMetadata, err := r.getURLMetadata(
+		ctx,
+		&state,
+	)
+
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Could not get file metadata from url.",
+			err.Error(),
+		)
+
+		return
+	}
+
+	plan.RemoteSize = types.Int64PointerValue(urlMetadata.Size)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
